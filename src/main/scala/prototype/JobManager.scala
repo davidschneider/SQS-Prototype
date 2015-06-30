@@ -1,20 +1,15 @@
 package prototype
 
 import akka.actor.{Props, ActorSystem, Actor}
+import com.rabbitmq.client.{QueueingConsumer, ConnectionFactory}
 
-import scala.collection.JavaConversions._
 import scala.concurrent.Future
 
 import scala.concurrent.duration._
 
-import com.amazonaws.auth.profile.ProfileCredentialsProvider
-import com.amazonaws.regions.{Regions, Region}
-import com.amazonaws.services.sqs.AmazonSQSClient
-import com.amazonaws.services.sqs.model._
-
 import scala.util.Random
 
-case class NewJob(m: Message)
+case class NewJob(s: String)
 
 case class NewStatus(id: String, status: String)
 
@@ -26,11 +21,20 @@ case object Stop
 
 object JobManager {
 
-  val credentials = new ProfileCredentialsProvider().getCredentials
+  val factory = new ConnectionFactory()
+  factory.setHost("192.168.56.101")
+  val connection = factory.newConnection()
+  val channel = connection.createChannel()
 
-  val sqs = new AmazonSQSClient(credentials)
-  val usEast1 = Region.getRegion(Regions.US_EAST_1)
-  sqs.setRegion(usEast1)
+  channel.queueDeclare("jm_newjob", false, false, false, null)
+  channel.queueDeclare("w_newjob", false, false, false, null)
+  channel.queueDeclare("jm_status", false, false, false, null)
+
+  val newJobConsumer = new QueueingConsumer(channel)
+  channel.basicConsume("jm_newjob", true, newJobConsumer)
+
+  val newStatusConsumer = new QueueingConsumer(channel)
+  channel.basicConsume("jm_status", true, newStatusConsumer)
 
   val system = ActorSystem("JobManager")
   val jm = system.actorOf(Props[JobManagerActor])
@@ -42,12 +46,8 @@ object JobManager {
   class JobPollingActor extends Actor {
     def receive = {
       case PollNewJob(q) =>
-        val rmr = new ReceiveMessageRequest().withQueueUrl(q).withWaitTimeSeconds(20)
-        val rm = sqs.receiveMessage(rmr)
-        for (m <- rm.getMessages) {
-          jm ! NewJob(m)
-          sqs.deleteMessage(new DeleteMessageRequest(q, m.getReceiptHandle))
-        }
+        val m = newJobConsumer.nextDelivery()
+        jm ! NewJob(new String(m.getBody))
         self ! PollNewJob(q)
     }
   }
@@ -55,12 +55,8 @@ object JobManager {
   class StatusPollingActor extends Actor {
     def receive = {
       case PollNewStatus(q) =>
-        val rmr = new ReceiveMessageRequest().withQueueUrl(q).withWaitTimeSeconds(20)
-        val rm = sqs.receiveMessage(rmr)
-        for (m <- rm.getMessages) {
-          jm ! NewStatus(m.getMessageId, m.getBody)
-          sqs.deleteMessage(new DeleteMessageRequest(q, m.getReceiptHandle))
-        }
+        val m = newStatusConsumer.nextDelivery()
+        jm ! NewStatus(m.getEnvelope.getDeliveryTag.toString, new String(m.getBody))
         self ! PollNewStatus(q)
     }
   }
@@ -69,9 +65,9 @@ object JobManager {
 
     def receive = {
       case NewJob(m) =>
-        System.out.println("received new job: " + m.getBody)
-        sqs.sendMessage("w_newjob", m.getBody)
-        if (m.getBody.equalsIgnoreCase("stop")) self ! Stop
+        System.out.println("received new job: " + m)
+        channel.basicPublish("", "w_newjob", null, m.getBytes)
+        if (m.equalsIgnoreCase("stop")) self ! Stop
       case NewStatus(m, s) => System.out.println("received new status: " + s)
       case Stop =>
         system.shutdown()
@@ -95,10 +91,15 @@ object Worker {
 
   val random = new Random()
 
-  val credentials = new ProfileCredentialsProvider().getCredentials
+  val factory = new ConnectionFactory()
+  factory.setHost("192.168.56.101")
+  val connection = factory.newConnection()
+  val channel = connection.createChannel()
 
-  val sqs = new AmazonSQSClient(credentials)
-  val usEast1 = Region.getRegion(Regions.US_EAST_1)
+  channel.queueDeclare("w_newjob", false, false, false, null)
+
+  val newJobConsumer = new QueueingConsumer(channel)
+  channel.basicConsume("w_newjob", true, newJobConsumer)
 
   val system = ActorSystem("Worker")
   val w = system.actorOf(Props[WorkerActor])
@@ -109,13 +110,8 @@ object Worker {
   class PollingActor extends Actor {
     def receive = {
       case PollNewJob(q) =>
-        val rmr = new ReceiveMessageRequest().withQueueUrl(q).withWaitTimeSeconds(20)
-        val wm = sqs.receiveMessage(rmr)
-        System.out.println(s"received ${wm.getMessages.size} messages")
-        for (m <- wm.getMessages) {
-          w ! NewJob(m)
-          sqs.deleteMessage(new DeleteMessageRequest(q, m.getReceiptHandle))
-        }
+        val m = newJobConsumer.nextDelivery()
+        w ! NewJob(new String(m.getBody))
         self ! PollNewJob(q)
     }
   }
@@ -125,11 +121,11 @@ object Worker {
     def receive = {
       case NewJob(m) =>
         Future {
-          System.out.println("received new job: " + m.getBody)
-          sqs.sendMessage("jm_status", "running")
+          System.out.println("received new job: " + m)
+          channel.basicPublish("", "jm_status", null, "running".getBytes)
           Thread.sleep((random.nextInt(9) + 1) * 1000)
-          sqs.sendMessage("jm_status", "finished")
-          if (m.getBody.equalsIgnoreCase("stop")) self ! Stop
+          channel.basicPublish("", "jm_status", null, "finished".getBytes)
+          if (m.equalsIgnoreCase("stop")) self ! Stop
         }
       case Stop =>
         system.shutdown()
@@ -149,18 +145,23 @@ object Worker {
 
 object Test {
 
-  val credentials = new ProfileCredentialsProvider().getCredentials
+  val factory = new ConnectionFactory()
+  factory.setHost("192.168.56.101")
+  val connection = factory.newConnection()
+  val channel = connection.createChannel()
 
-  val sqs = new AmazonSQSClient(credentials)
-  val usEast1 = Region.getRegion(Regions.US_EAST_1)
+  channel.queueDeclare("jm_newjob", false, false, false, null)
 
   def main(args: Array[String]): Unit = {
 
     for (i <- 1 until 1000) {
 
-      sqs.sendMessage("jm_newjob", i.toString)
+      channel.basicPublish("", "jm_newjob", null, i.toString.getBytes)
 
     }
+
+    channel.close()
+    connection.close()
 
     //    sqs.sendMessage("jm_newjob", "stop")
 
